@@ -1,0 +1,64 @@
+{
+  "name": "slack-session-kit",
+  "version": "0.1.0",
+  "description": "TypeScript SDK, CLI, and stdio MCP server for Slack workspace session and bot operations without creating a Slack App",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "slack-session-kit": "./dist/cli/bin.js",
+    "slack-session-kit-mcp": "./dist/mcp/bin.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./sdk": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./cli": {
+      "types": "./dist/cli/index.d.ts",
+      "import": "./dist/cli/index.js"
+    },
+    "./mcp": {
+      "types": "./dist/mcp/index.d.ts",
+      "import": "./dist/mcp/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit",
+    "pretest": "npm run build",
+    "test": "node --import tsx --test test/**/*.test.ts",
+    "prepack": "npm run build"
+  },
+  "keywords": [
+    "slack",
+    "sdk",
+    "cli",
+    "mcp",
+    "modelcontextprotocol"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.6.1",
+    "@slack/web-api": "^7.8.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
