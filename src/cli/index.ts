@@ -7,6 +7,7 @@ import { parseArgs } from 'node:util';
 import { SlackOperations } from '../operations.js';
 import { SlackSessionKitError } from '../types.js';
 import { redactSecrets } from '../utils/redact.js';
+import { loadChromeSlackSession } from '../internal/chrome-session.js';
 
 /**
  * Strictly parses a finite non-negative integer string (rejects "2x", negatives, floats, NaN).
@@ -34,6 +35,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
   const options = {
     write: { type: 'boolean', default: false },
     experimental: { type: 'boolean', default: false },
+    'from-chrome': { type: 'boolean', default: false },
     help: { type: 'boolean', short: 'h', default: false },
 
     // Operation specific flags
@@ -80,8 +82,27 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
   const getBool = (val: unknown): boolean => val === true;
 
   try {
-    // Credentials MUST come from environment variables (prevents process list exposure via ps aux)
+    const fromChrome = getBool(values['from-chrome']);
+    let token: string | undefined;
+    let cookieD: string | undefined;
+
+    if (fromChrome) {
+      const hasEnvToken = Boolean(process.env['SLACK_SESSION_TOKEN'] || process.env['SLACK_TOKEN']);
+      if (hasEnvToken) {
+        throw new SlackSessionKitError(
+          'Cannot use --from-chrome together with environment variable token (SLACK_SESSION_TOKEN or SLACK_TOKEN).',
+          'AUTH_CONFLICT'
+        );
+      }
+      const chromeSession = await loadChromeSlackSession();
+      token = chromeSession.token;
+      cookieD = chromeSession.cookieD;
+      process.stderr.write(`[slack-session-kit] Authenticated via Chrome session as ${chromeSession.user} (${chromeSession.team})\n`);
+    }
+
     const ops = new SlackOperations({
+      token,
+      cookieD,
       allowWrite: getBool(values.write),
       allowExperimental: getBool(values.experimental),
     });
@@ -212,7 +233,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
 
 function printHelp(): void {
   console.log(`
-Slack Session Kit CLI (0.1.0)
+Slack Session Kit CLI (0.2.0)
 
 AUTHENTICATION:
   Credentials MUST be supplied via environment variables to prevent exposure in process lists:
@@ -240,6 +261,7 @@ COMMANDS:
   client-counts                 Get unread counts (--experimental) [Browser session only]
 
 GLOBAL OPTIONS:
+  --from-chrome                 Authenticate using local Chrome browser session
   --write                       Opt-in to allow write operations
   --experimental                Opt-in to allow experimental internal APIs (list-saved, client-counts)
   -h, --help                    Show this help message

@@ -35,7 +35,7 @@ describe('SlackSessionKit SDK', () => {
       let interceptedHeaders: Headers | undefined;
       const mockFetch: typeof fetch = async (input, init) => {
         interceptedHeaders = new Headers(init?.headers);
-        return new Response(JSON.stringify({ ok: true, url: 'https://test.slack.com/', user: 'alice', team: 'Acme' }), {
+        return new Response(JSON.stringify({ ok: true, url: 'https://example.slack.com/', user: 'alice', team: 'Acme' }), {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
         });
@@ -80,10 +80,10 @@ describe('SlackSessionKit SDK', () => {
     it('strictly rejects malicious host and path tricks before network call', async () => {
       const maliciousBases = [
         'http://localhost.attacker.example/api',
-        'http://localhost@attacker.example/api',
+        'http://user-a160e88@example.com/api',
         'http://127.0.0.1.attacker.example/api',
         'http://slack.com/api', // Insecure HTTP Slack
-        'https://user:password@slack.com/api', // Embedded credentials
+        'https://user:user-d84245b@example.com/api', // Embedded credentials
         'https://slack.com/api-evil', // Path trick
         'https://slack.com/else/api', // Path trick
         'https://slack.com/api?leak=1', // Query parameter forbidden

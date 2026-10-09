@@ -65,7 +65,7 @@ export class SlackHttpClient {
       throw new SlackSessionKitError(`Invalid API URL: ${redactSecrets(urlStr, this.knownSecrets)}`, 'INVALID_URL');
     }
 
-    // 1. Credentials in URL (e.g. https://user:pass@slack.com) are strictly forbidden
+    // 1. Credentials in URL (e.g. https://user:user-ec547e4@example.com) are strictly forbidden
     if (parsedUrl.username || parsedUrl.password) {
       throw new SlackSessionKitError('URLs with embedded credentials are not allowed', 'INVALID_URL');
     }

@@ -1,6 +1,6 @@
 {
   "name": "slack-session-kit",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "TypeScript SDK, CLI, and stdio MCP server for Slack workspace session and bot operations without creating a Slack App",
   "type": "module",
   "main": "./dist/index.js",
@@ -46,7 +46,6 @@
     "mcp",
     "modelcontextprotocol"
   ],
-  "author": "",
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.6.1",
@@ -60,5 +59,6 @@
   },
   "engines": {
     "node": ">=22.0.0"
-  }
+  },
+  "private": true
 }

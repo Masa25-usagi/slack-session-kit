@@ -82,4 +82,13 @@ describe('CLI process execution tests', () => {
     assert.equal(res.code, 1);
     assert.ok(res.stderr.includes('WRITE_NOT_ALLOWED'));
   });
+
+  it('rejects --from-chrome when environment variable token is also provided', async () => {
+    const res = await runCliProcess(
+      ['auth-test', '--from-chrome'],
+      { SLACK_TOKEN: 'xoxp-cli-test' }
+    );
+    assert.equal(res.code, 1);
+    assert.ok(res.stderr.includes('AUTH_CONFLICT') || res.stderr.includes('Cannot use --from-chrome together with environment variable'));
+  });
 });

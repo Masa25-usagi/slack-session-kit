@@ -5,7 +5,11 @@
  * Security & Design:
  * - Shares exact validation schemas (.shape) with SDK and CLI.
  * - Read-only by default. Write tools are NOT registered unless allowWrite is true.
+ * - Double execution-path check on write operations (WriteNotAllowedError).
  * - Experimental internal tools are NOT registered unless allowExperimental is true.
+ * - Supports one-time in-memory Chrome session resolution at startup (SLACK_AUTH_SOURCE=chrome).
+ * - Explicit fail-fast on Chrome resolution error; no implicit fallback to environment.
+ * - Session revocation gate: when invalid_auth / token_revoked is encountered, rejects further tools until server restart.
  * - No shell, file access, or arbitrary API tools are exposed.
  * - stdout is strictly reserved for the MCP protocol. All logs go to stderr.
  */
@@ -13,8 +17,9 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { SlackOperations } from '../operations.js';
-import { ClientConfig, SlackSessionKitError } from '../types.js';
+import { ClientConfig, SlackSessionKitError, WriteNotAllowedError } from '../types.js';
 import { redactSecrets } from '../utils/redact.js';
+import { loadChromeSlackSession } from '../internal/chrome-session.js';
 import {
   AuthTestSchema,
   ConversationsHistorySchema,
@@ -30,6 +35,11 @@ import {
   ClientCountsSchema,
 } from '../utils/validation.js';
 
+export interface McpServerConfig extends ClientConfig {
+  /** Authentication source: 'env' (default) or 'chrome' (one-time resolution at startup) */
+  authSource?: 'chrome' | 'env';
+}
+
 export function createMcpServer(config: ClientConfig = {}): {
   server: McpServer;
   ops: SlackOperations;
@@ -37,10 +47,25 @@ export function createMcpServer(config: ClientConfig = {}): {
   const ops = new SlackOperations(config);
   const server = new McpServer({
     name: 'slack-session-kit',
-    version: '0.1.0',
+    version: '0.2.0',
   });
 
+  // Session revocation state
+  let isSessionRevoked = false;
+
   const wrapHandler = (fn: (args: any) => Promise<unknown>) => async (args: any) => {
+    if (isSessionRevoked) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: 'text' as const,
+            text: 'Slack session has expired or been revoked. Please log in to Slack in Chrome and restart the MCP server.',
+          },
+        ],
+      };
+    }
+
     try {
       const result = await fn(args);
       return {
@@ -52,6 +77,22 @@ export function createMcpServer(config: ClientConfig = {}): {
         ],
       };
     } catch (err: unknown) {
+      // Check for session revocation
+      if (err instanceof SlackSessionKitError) {
+        const json = err.toJSON();
+        const slackErr = String((json as any)?.details?.error || '');
+        const revokeErrors = new Set([
+          'invalid_auth',
+          'token_revoked',
+          'account_inactive',
+          'not_authed',
+          'session_expired',
+        ]);
+        if (revokeErrors.has(slackErr)) {
+          isSessionRevoked = true;
+        }
+      }
+
       const msg = err instanceof SlackSessionKitError
         ? JSON.stringify(err.toJSON(), null, 2)
         : err instanceof Error
@@ -69,6 +110,15 @@ export function createMcpServer(config: ClientConfig = {}): {
       };
     }
   };
+
+  const wrapWriteHandler = (fn: (args: any) => Promise<unknown>, opName: string) =>
+    wrapHandler(async (args: any) => {
+      // Defense in depth: runtime check on write execution path
+      if (!ops.isWriteAllowed()) {
+        throw new WriteNotAllowedError(opName);
+      }
+      return fn(args);
+    });
 
   // --- Read-Only Tools (Registered by default, using shared schema shapes) ---
 
@@ -121,28 +171,28 @@ export function createMcpServer(config: ClientConfig = {}): {
       'send_message',
       'Post a new message or reply to a thread in a channel. (Write tool)',
       ChatPostMessageSchema.shape,
-      wrapHandler(async (args) => ops.sendMessage(args))
+      wrapWriteHandler(async (args) => ops.sendMessage(args), 'chat.postMessage')
     );
 
     server.tool(
       'create_list_item',
       'Create a new row/item in a Slack List using official initial_fields array. (Write tool)',
       SlackListsItemsCreateSchema.shape,
-      wrapHandler(async (args) => ops.createListItem(args))
+      wrapWriteHandler(async (args) => ops.createListItem(args), 'slackLists.items.create')
     );
 
     server.tool(
       'update_list_item',
       'Update cells in an existing Slack List using official cells array (with row_id + column_id). (Write tool)',
       SlackListsItemsUpdateSchema.shape,
-      wrapHandler(async (args) => ops.updateListItem(args))
+      wrapWriteHandler(async (args) => ops.updateListItem(args), 'slackLists.items.update')
     );
 
     server.tool(
       'append_canvas',
       'Append Markdown content to the end of a Slack Canvas (action: insert_at_end). (Write tool)',
       CanvasesEditSchema.shape,
-      wrapHandler(async (args) => ops.appendCanvas(args))
+      wrapWriteHandler(async (args) => ops.appendCanvas(args), 'canvases.edit')
     );
   }
 
@@ -167,8 +217,26 @@ export function createMcpServer(config: ClientConfig = {}): {
   return { server, ops };
 }
 
-export async function runMcpServer(config: ClientConfig = {}): Promise<void> {
-  const { server } = createMcpServer(config);
+export async function runMcpServer(config: McpServerConfig = {}): Promise<void> {
+  const authSource = config.authSource ?? (process.env['SLACK_AUTH_SOURCE'] === 'chrome' ? 'chrome' : 'env');
+  const resolvedConfig = { ...config };
+
+  if (authSource === 'chrome') {
+    process.stderr.write('[slack-session-kit] Resolving authentication from local Chrome session...\n');
+    try {
+      const chromeSession = await loadChromeSlackSession();
+      resolvedConfig.token = chromeSession.token;
+      resolvedConfig.cookieD = chromeSession.cookieD;
+      process.stderr.write(`[slack-session-kit] Authenticated via Chrome session as ${chromeSession.user} (${chromeSession.team})\n`);
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`[slack-session-kit] Failed to authenticate via Chrome session: ${redactSecrets(errMsg)}\n`);
+      process.stderr.write('[slack-session-kit] Please ensure Chrome is open with Slack logged in, or supply SLACK_SESSION_TOKEN and SLACK_COOKIE_D environment variables.\n');
+      throw err;
+    }
+  }
+
+  const { server } = createMcpServer(resolvedConfig);
   const transport = new StdioServerTransport();
   process.stderr.write('[slack-session-kit] MCP Server connecting to stdio...\n');
   await server.connect(transport);
