@@ -24,6 +24,14 @@ export interface SlackHttpClientOptions {
   fetchFn?: typeof fetch | undefined;
 }
 
+// These read endpoints ignore or reject JSON parameters with browser sessions.
+// Keep JSON for APIs with structured payloads, such as Lists and Canvas.
+const FORM_ENCODED_METHODS = new Set([
+  'conversations.list',
+  'conversations.replies',
+  'search.messages',
+]);
+
 export class SlackHttpClient {
   private readonly token: string;
   private readonly cookieD?: string | undefined;
@@ -114,10 +122,20 @@ export class SlackHttpClient {
     this.validateTargetUrl(url, apiMethod);
 
     const fetchFn = this.customFetch ?? globalThis.fetch;
+    const formEncoded = FORM_ENCODED_METHODS.has(apiMethod);
+    const body = formEncoded
+      ? new URLSearchParams(
+          Object.entries(params ?? {})
+            .filter(([, value]) => value !== undefined)
+            .map(([key, value]): [string, string] => [key, String(value)])
+        ).toString()
+      : JSON.stringify(params ?? {});
 
     const headers: Record<string, string> = {
       'Authorization': `Bearer ${this.token}`,
-      'Content-Type': 'application/json; charset=utf-8',
+      'Content-Type': formEncoded
+        ? 'application/x-www-form-urlencoded; charset=utf-8'
+        : 'application/json; charset=utf-8',
     };
 
     // Only attach browser session cookie if authenticated as browser_session
@@ -140,7 +158,7 @@ export class SlackHttpClient {
       response = await fetchFn(url, {
         method: 'POST',
         headers,
-        body: JSON.stringify(params ?? {}),
+        body,
         signal: controller.signal,
         redirect: 'manual', // Never follow redirects automatically
       });

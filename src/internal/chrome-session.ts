@@ -147,10 +147,12 @@ export function extractTokenFromLocalConfig(raw: string): { token: string; teamI
   }
 }
 
-/**
- * Reads port number from DevToolsActivePort file.
- */
-export async function readDevToolsActivePort(customPath?: string): Promise<number> {
+interface DevToolsEndpoint {
+  port: number;
+  browserPath: string | undefined;
+}
+
+async function readDevToolsEndpoint(customPath?: string): Promise<DevToolsEndpoint> {
   const candidatePaths = customPath
     ? [customPath]
     : [
@@ -177,7 +179,7 @@ export async function readDevToolsActivePort(customPath?: string): Promise<numbe
 
   const lines = rawContent.split(/\r?\n/);
   const firstLine = lines[0]?.trim();
-  const port = Number.parseInt(firstLine ?? '', 10);
+  const port = /^\d+$/.test(firstLine ?? '') ? Number(firstLine) : NaN;
 
   if (!Number.isInteger(port) || port <= 0 || port > 65535) {
     throw new ChromeSessionError(
@@ -186,7 +188,12 @@ export async function readDevToolsActivePort(customPath?: string): Promise<numbe
     );
   }
 
-  return port;
+  return { port, browserPath: lines[1]?.trim() || undefined };
+}
+
+/** Reads port number from DevToolsActivePort file. */
+export async function readDevToolsActivePort(customPath?: string): Promise<number> {
+  return (await readDevToolsEndpoint(customPath)).port;
 }
 
 interface CdpTarget {
@@ -195,6 +202,117 @@ interface CdpTarget {
   url: string;
   title: string;
   webSocketDebuggerUrl?: string;
+}
+
+interface CdpConnection {
+  send(method: string, params?: Record<string, unknown>, sessionId?: string): Promise<Record<string, any>>;
+  close(): void;
+}
+
+function validateWebSocketUrl(urlString: string, port: number): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(urlString);
+  } catch {
+    throw new ChromeSessionError('Invalid WebSocket URL received from DevTools', 'INVALID_WS_URL');
+  }
+  if (parsed.protocol !== 'ws:' || !isStrictLoopbackIp(parsed.hostname) || parsed.port !== String(port)
+      || parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw new ChromeSessionError(
+      `DevTools WebSocket must use strict loopback 127.0.0.1:${port} without credentials or query parameters`,
+      'INSECURE_WS_HOST'
+    );
+  }
+  return parsed.href;
+}
+
+/** One short-lived CDP connection, with bounded open/command waits and cleanup on disconnect. */
+async function connectCdp(url: string, WsClass: typeof WebSocket, timeoutMs: number): Promise<CdpConnection> {
+  const ws = new WsClass(url);
+  const pending = new Map<number, {
+    resolve(value: Record<string, any>): void;
+    reject(error: Error): void;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
+  let nextId = 1;
+  let closed = false;
+  let rejectOpen: (error: Error) => void;
+  let openTimer: ReturnType<typeof setTimeout>;
+  const opened = new Promise<void>((resolve, reject) => {
+    rejectOpen = reject;
+    openTimer = setTimeout(() => reject(new ChromeSessionError('Timed out connecting to CDP WebSocket', 'CDP_TIMEOUT')), timeoutMs);
+    ws.onopen = () => { clearTimeout(openTimer); resolve(); };
+  });
+  const fail = (error: Error): void => {
+    closed = true;
+    clearTimeout(openTimer);
+    rejectOpen(error);
+    for (const request of pending.values()) {
+      clearTimeout(request.timer);
+      request.reject(error);
+    }
+    pending.clear();
+  };
+  ws.onerror = () => fail(new ChromeSessionError('CDP WebSocket error occurred', 'CDP_WS_ERROR'));
+  ws.onclose = () => fail(new ChromeSessionError('CDP WebSocket closed unexpectedly', 'CDP_CLOSED'));
+  ws.onmessage = (event) => {
+    if (typeof event.data !== 'string') return;
+    let data;
+    try { data = JSON.parse(event.data); } catch { return; }
+    const request = pending.get(data?.id);
+    if (!request) return;
+    pending.delete(data.id);
+    clearTimeout(request.timer);
+    if (data.error) {
+      request.reject(new ChromeSessionError('Chrome rejected a CDP command', 'CDP_COMMAND_FAILED'));
+    } else {
+      request.resolve(data.result ?? {});
+    }
+  };
+  try {
+    await opened;
+  } catch (err) {
+    try { ws.close(); } catch {}
+    throw err;
+  }
+  return {
+    send(method, params = {}, sessionId) {
+      if (closed) return Promise.reject(new ChromeSessionError('CDP WebSocket is closed', 'CDP_CLOSED'));
+      const id = nextId++;
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pending.delete(id);
+          reject(new ChromeSessionError(`Timed out waiting for Chrome CDP ${method}`, 'CDP_TIMEOUT'));
+        }, timeoutMs);
+        pending.set(id, { resolve, reject, timer });
+        try {
+          ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
+        } catch {
+          pending.delete(id);
+          clearTimeout(timer);
+          reject(new ChromeSessionError('Failed to send Chrome CDP command', 'CDP_WS_ERROR'));
+        }
+      });
+    },
+    close() { try { ws.close(); } catch {} },
+  };
+}
+
+function chooseSlackTarget(targets: CdpTarget[]): CdpTarget {
+  const slackTargets = targets.filter(t => t && (t.type === 'page' || !t.type) && isSlackWorkspaceUrl(t.url));
+  const chosen = slackTargets[0];
+  if (!chosen) {
+    throw new ChromeSessionError('No active Slack tabs found in Chrome. Please open Slack in Chrome and ensure you are logged in.', 'NO_SLACK_PAGE_TARGET');
+  }
+  const workspaces = new Set(slackTargets.map(t => {
+    const url = new URL(t.url);
+    // Different workspaces can share the app.slack.com hostname.
+    return url.pathname.match(/^\/client\/(T[A-Z0-9]+)(?:\/|$)/i)?.[1] ?? url.hostname;
+  }));
+  if (workspaces.size > 1) {
+    throw new ChromeSessionError('Multiple Slack workspace tabs detected in Chrome. Close other Slack tabs to authenticate unambiguously.', 'AMBIGUOUS_WORKSPACE');
+  }
+  return chosen;
 }
 
 /**
@@ -206,214 +324,100 @@ export async function loadChromeSlackSession(options: ChromeSessionOptions = {})
   const timeoutMs = options.timeoutMs ?? 5000;
   const slackApiBase = options.slackApiBaseUrl ?? 'https://slack.com/api';
 
-  const port = await readDevToolsActivePort(options.activePortPath);
-
-  // 1. HTTP Query to 127.0.0.1 strictly
-  const listUrl = `http://127.0.0.1:${port}/json/list`;
-  let targets: CdpTarget[];
-  try {
-    const res = await fetchFn(listUrl, {
-      redirect: 'error', // Guardrail: strictly refuse any redirects
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    if (!res.ok) {
-      throw new ChromeSessionError(
-        `DevTools endpoint returned HTTP ${res.status}`,
-        'DEVTOOLS_HTTP_ERROR'
-      );
-    }
-    targets = (await res.json()) as CdpTarget[];
-  } catch (err: unknown) {
-    if (err instanceof ChromeSessionError) throw err;
-    throw new ChromeSessionError(
-      `Failed to connect to Chrome DevTools at 127.0.0.1:${port}: ${err instanceof Error ? err.message : String(err)}`,
-      'DEVTOOLS_CONNECTION_FAILED'
-    );
-  }
-
-  // 2. Filter for strictly valid Slack targets
-  const slackTargets = targets.filter(
-    (t) => (t.type === 'page' || !t.type) && isSlackWorkspaceUrl(t.url) && t.webSocketDebuggerUrl
-  );
-
-  if (slackTargets.length === 0) {
-    throw new ChromeSessionError(
-      'No active Slack tabs found in Chrome. Please open Slack in Chrome and ensure you are logged in.',
-      'NO_SLACK_PAGE_TARGET'
-    );
-  }
-
-  if (slackTargets.length > 1) {
-    // Check if multiple targets belong to different hosts
-    const distinctHosts = new Set(slackTargets.map((t) => new URL(t.url).hostname));
-    if (distinctHosts.size > 1) {
-      throw new ChromeSessionError(
-        'Multiple Slack workspace tabs detected in Chrome. Close other Slack tabs to authenticate unambiguously.',
-        'AMBIGUOUS_WORKSPACE'
-      );
-    }
-  }
-
-  const chosenTarget = slackTargets[0];
-  if (!chosenTarget || !chosenTarget.webSocketDebuggerUrl) {
-    throw new ChromeSessionError(
-      'No usable Slack WebSocket debugger URL found in Chrome targets.',
-      'NO_SLACK_PAGE_TARGET'
-    );
-  }
-  const wsUrlString = chosenTarget.webSocketDebuggerUrl;
-  const targetPageUrl = chosenTarget.url;
-
-  // 3. Strict verification of WebSocket URL
-  let parsedWsUrl: URL;
-  try {
-    parsedWsUrl = new URL(wsUrlString);
-  } catch {
-    throw new ChromeSessionError('Invalid WebSocket URL received from DevTools', 'INVALID_WS_URL');
-  }
-
-  if (parsedWsUrl.protocol !== 'ws:' || !isStrictLoopbackIp(parsedWsUrl.hostname) || parsedWsUrl.port !== String(port)) {
-    throw new ChromeSessionError(
-      `DevTools WebSocket host is not strict loopback 127.0.0.1:${port}`,
-      'INSECURE_WS_HOST'
-    );
-  }
-
-  // 4. Connect WebSocket, read token & d cookie, and IMMEDIATELY close
+  const { port, browserPath } = await readDevToolsEndpoint(options.activePortPath);
+  let connection: CdpConnection | undefined;
   let sessionToken: string | null = null;
   let sessionCookieD: string | null = null;
 
-  const ws = new WsClass(wsUrlString);
-
   try {
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        try { ws.close(); } catch {}
-        reject(new ChromeSessionError('Timed out connecting to CDP WebSocket', 'CDP_TIMEOUT'));
-      }, timeoutMs);
-
-      let msgId = 1;
-      const pending = new Map<number, { resolve: (res: any) => void; reject: (err: any) => void }>();
-
-      const sendCdp = (method: string, params: Record<string, unknown> = {}): Promise<any> => {
-        const id = msgId++;
-        return new Promise((res, rej) => {
-          pending.set(id, { resolve: res, reject: rej });
-          ws.send(JSON.stringify({ id, method, params }));
-        });
-      };
-
-      ws.onopen = async () => {
-        try {
-          // A. Read token via localConfig_v2 or boot_data
-          const evalRes = await sendCdp('Runtime.evaluate', {
-            expression: `(() => {
-              try {
-                if (window.boot_data && typeof window.boot_data.api_token === 'string') {
-                  return JSON.stringify({ bootToken: window.boot_data.api_token });
-                }
-                const cfg = localStorage.getItem('localConfig_v2');
-                if (cfg) return JSON.stringify({ localConfig: cfg });
-              } catch (e) {}
-              return null;
-            })()`,
-            returnByValue: true,
-          });
-
-          const rawVal = evalRes?.result?.value;
-          if (typeof rawVal === 'string') {
-            try {
-              const parsed = JSON.parse(rawVal);
-              if (parsed?.bootToken && typeof parsed.bootToken === 'string' && parsed.bootToken.startsWith('xoxc-')) {
-                sessionToken = parsed.bootToken;
-              } else if (parsed?.localConfig && typeof parsed.localConfig === 'string') {
-                const extracted = extractTokenFromLocalConfig(parsed.localConfig);
-                if (extracted) sessionToken = extracted.token;
-              }
-            } catch {}
-          }
-
-          if (!sessionToken) {
-            throw new ChromeSessionError(
-              'Could not extract Slack session token (xoxc-) from Slack page in Chrome.',
-              'TOKEN_EXTRACTION_FAILED'
-            );
-          }
-
-          // B. Read d cookie via Network.getCookies or Storage.getCookies
-          let cookiesRes: any = null;
-          try {
-            cookiesRes = await sendCdp('Network.getCookies', { urls: [targetPageUrl] });
-          } catch {
-            // fallback
-            cookiesRes = await sendCdp('Storage.getCookies');
-          }
-
-          const rawCookies = cookiesRes?.cookies;
-          if (Array.isArray(rawCookies)) {
-            sessionCookieD = extractXoxdFromCookies(rawCookies);
-            // Guardrail: immediately drop reference to other cookies
-            rawCookies.length = 0;
-          }
-
-          if (!sessionCookieD) {
-            throw new ChromeSessionError(
-              'Could not extract Slack session cookie (d=xoxd-...) from Chrome.',
-              'COOKIE_EXTRACTION_FAILED'
-            );
-          }
-
-          clearTimeout(timer);
-          resolve();
-        } catch (err) {
-          clearTimeout(timer);
-          reject(err);
-        }
-      };
-
-      ws.onmessage = (event: any) => {
-        try {
-          const data = typeof event.data === 'string' ? JSON.parse(event.data) : null;
-          if (data && typeof data.id === 'number') {
-            const handler = pending.get(data.id);
-            if (handler) {
-              pending.delete(data.id);
-              if (data.error) {
-                handler.reject(new Error(data.error.message || 'CDP Error'));
-              } else {
-                handler.resolve(data.result);
-              }
-            }
-          }
-        } catch {}
-      };
-
-      ws.onerror = (_evt: any) => {
-        clearTimeout(timer);
-        reject(new ChromeSessionError('CDP WebSocket error occurred', 'CDP_WS_ERROR'));
-      };
-
-      ws.onclose = () => {
-        // If connection closed prematurely
-        for (const handler of pending.values()) {
-          handler.reject(new ChromeSessionError('CDP WebSocket closed unexpectedly', 'CDP_CLOSED'));
-        }
-        pending.clear();
-      };
+    const res = await fetchFn(`http://127.0.0.1:${port}/json/list`, {
+      redirect: 'error',
+      signal: AbortSignal.timeout(timeoutMs),
+    }).catch(() => {
+      throw new ChromeSessionError(`Failed to connect to Chrome DevTools at 127.0.0.1:${port}`, 'DEVTOOLS_CONNECTION_FAILED');
     });
-  } finally {
-    // Guardrail: Close CDP WebSocket immediately
+
+    let target: CdpTarget;
+    let sessionId: string | undefined;
+    if (res.status === 404 && browserPath) {
+      // New Chrome default profiles can disable /json/* discovery while keeping
+      // the browser WebSocket advertised in DevToolsActivePort available.
+      if (!/^\/devtools\/browser\/[a-zA-Z0-9_-]+$/.test(browserPath)) {
+        throw new ChromeSessionError('Invalid browser WebSocket path in DevToolsActivePort', 'INVALID_WS_URL');
+      }
+      const browserUrl = validateWebSocketUrl(`ws://127.0.0.1:${port}${browserPath}`, port);
+      connection = await connectCdp(browserUrl, WsClass, timeoutMs);
+      const discovered = await connection.send('Target.getTargets');
+      if (!Array.isArray(discovered['targetInfos'])) {
+        throw new ChromeSessionError('Invalid Chrome target list', 'INVALID_DEVTOOLS_RESPONSE');
+      }
+      target = chooseSlackTarget(discovered['targetInfos'].map((t: CdpTarget & { targetId: string }) => ({ ...t, id: t.targetId })));
+      const attached = await connection.send('Target.attachToTarget', { targetId: target.id, flatten: true });
+      if (typeof attached['sessionId'] !== 'string' || !attached['sessionId']) {
+        throw new ChromeSessionError('Chrome did not return a page session', 'CDP_ATTACH_FAILED');
+      }
+      sessionId = attached['sessionId'];
+    } else {
+      if (!res.ok) {
+        throw new ChromeSessionError(`DevTools endpoint returned HTTP ${res.status}`, 'DEVTOOLS_HTTP_ERROR');
+      }
+      const targets: unknown = await res.json();
+      if (!Array.isArray(targets)) {
+        throw new ChromeSessionError('Invalid Chrome target list', 'INVALID_DEVTOOLS_RESPONSE');
+      }
+      target = chooseSlackTarget(targets.filter(t => typeof t?.webSocketDebuggerUrl === 'string'));
+      const pageUrl = validateWebSocketUrl(target.webSocketDebuggerUrl!, port);
+      connection = await connectCdp(pageUrl, WsClass, timeoutMs);
+    }
+
+    const evalRes = await connection.send('Runtime.evaluate', {
+      expression: `(() => {
+        try {
+          if (window.boot_data && typeof window.boot_data.api_token === 'string') {
+            return JSON.stringify({ bootToken: window.boot_data.api_token });
+          }
+          const cfg = localStorage.getItem('localConfig_v2');
+          if (cfg) return JSON.stringify({ localConfig: cfg });
+        } catch (e) {}
+        return null;
+      })()`,
+      returnByValue: true,
+    }, sessionId);
+    const rawVal = evalRes['result']?.value;
+    if (typeof rawVal === 'string') {
+      let parsed;
+      try { parsed = JSON.parse(rawVal); } catch {}
+      if (typeof parsed?.bootToken === 'string' && parsed.bootToken.startsWith('xoxc-')) {
+        sessionToken = parsed.bootToken;
+      } else if (typeof parsed?.localConfig === 'string') {
+        sessionToken = extractTokenFromLocalConfig(parsed.localConfig)?.token ?? null;
+      }
+    }
+    if (!sessionToken) {
+      throw new ChromeSessionError('Could not extract Slack session token (xoxc-) from Slack page in Chrome.', 'TOKEN_EXTRACTION_FAILED');
+    }
+
+    let cookiesRes: Record<string, any>;
     try {
-      ws.close();
-    } catch {}
+      cookiesRes = await connection.send('Network.getCookies', { urls: [target.url] }, sessionId);
+    } catch (err) {
+      if (!(err instanceof ChromeSessionError) || err.code !== 'CDP_COMMAND_FAILED') throw err;
+      cookiesRes = await connection.send('Storage.getCookies', {}, sessionId);
+    }
+    const cookies = cookiesRes['cookies'];
+    if (Array.isArray(cookies)) {
+      sessionCookieD = extractXoxdFromCookies(cookies);
+      cookies.length = 0;
+    }
+    if (!sessionCookieD) {
+      throw new ChromeSessionError('Could not extract Slack session cookie (d=xoxd-...) from Chrome.', 'COOKIE_EXTRACTION_FAILED');
+    }
+  } finally {
+    connection?.close();
   }
 
-  if (!sessionToken || !sessionCookieD) {
-    throw new ChromeSessionError('Incomplete session credentials obtained from Chrome', 'INCOMPLETE_CREDENTIALS');
-  }
-
-  const finalToken: string = sessionToken;
-  const finalCookieD: string = sessionCookieD;
+  const finalToken = sessionToken;
+  const finalCookieD = sessionCookieD;
 
   // 5. Verify credentials immediately with auth.test
   try {

@@ -76,6 +76,55 @@ describe('SlackSessionKit SDK', () => {
     });
   });
 
+  describe('Read API form parameters', () => {
+    it('round-trips search, thread timestamps, limits and cursors through a real HTTP endpoint', async () => {
+      const received: Array<{ method: string; params: URLSearchParams }> = [];
+      const server = http.createServer(async (req, res) => {
+        let body = '';
+        for await (const chunk of req) body += chunk;
+        res.setHeader('Content-Type', 'application/json');
+        if (!req.headers['content-type']?.startsWith('application/x-www-form-urlencoded')) {
+          res.end(JSON.stringify({ ok: false, error: 'invalid_arguments' }));
+          return;
+        }
+        const params = new URLSearchParams(body);
+        received.push({ method: req.url!, params });
+        const data = req.url === '/api/search.messages'
+          ? { messages: { total: 1, matches: [{ text: params.get('query') }] } }
+          : req.url === '/api/conversations.replies'
+          ? { messages: [{ ts: params.get('ts') }] }
+          : { channels: Array.from({ length: Number(params.get('limit')) }, () => ({ id: 'C123' })) };
+        res.end(JSON.stringify({ ok: true, ...data }));
+      });
+      await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+      try {
+        const port = (server.address() as any).port;
+        const kit = new SlackSessionKit({
+          token: 'xoxc-form-test', cookieD: 'xoxd-form-test', baseUrl: `http://127.0.0.1:${port}/api`,
+        });
+        const query = 'in:general 日本語 + C++ & "AI"';
+        const search = await kit.searchMessages({ query, count: 3, page: 2 });
+        assert.equal(search.messages?.matches?.[0]?.text, query);
+        assert.equal(received[0]?.params.get('count'), '3');
+        assert.equal(received[0]?.params.get('page'), '2');
+
+        const threadTs = '1234567890.000123';
+        const replies = await kit.getReplies({ channel: 'C123', ts: threadTs, limit: 3, cursor: 'next+/=' });
+        assert.equal(replies.messages?.[0]?.ts, threadTs);
+        assert.equal(received[1]?.params.get('channel'), 'C123');
+        assert.equal(received[1]?.params.get('cursor'), 'next+/=');
+
+        const channels = await kit.listChannels({ limit: 5, types: 'public_channel,private_channel' });
+        assert.equal(channels.channels?.length, 5);
+        assert.equal(received[2]?.params.get('types'), 'public_channel,private_channel');
+        assert.deepEqual(received.map(r => r.method), ['/api/search.messages', '/api/conversations.replies', '/api/conversations.list']);
+      } finally {
+        server.closeAllConnections();
+        await new Promise<void>(resolve => server.close(() => resolve()));
+      }
+    });
+  });
+
   describe('Host Gate & Exact URL Path validation', () => {
     it('strictly rejects malicious host and path tricks before network call', async () => {
       const maliciousBases = [
